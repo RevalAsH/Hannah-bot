@@ -3,22 +3,15 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'hannah123';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const IG_USER_ID = process.env.IG_USER_ID;
 const PORT = process.env.PORT || 3000;
 
-// CONFIGURE HANNAH'S REPLIES HERE - from your dashboard
-const automations = [
-  { trigger: 'hello', response: "Heyy! It's Hannah here — RevlAsH's assistant 💫 How can I help?" },
-  { trigger: 'hi', response: "Heyy! It's Hannah here — RevlAsH's assistant 💫 How can I help?" },
-  { trigger: 'price', response: "For pricing/commissions, RevlAsH will get back to you! Can you tell me what you need?" },
-  { trigger: 'commission', response: "Got it! For commissions, please share details and budget — RevlAsH will reply soon 🔥" },
-  { trigger: 'link', response: "Here's RevlAsH's links! What do you need specifically?" },
-];
+console.log('Hannah starting... VERIFY_TOKEN:', !!VERIFY_TOKEN, 'PAGE_TOKEN:', !!PAGE_ACCESS_TOKEN);
 
-// Instagram webhook verification (Meta calls this once)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -31,43 +24,121 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Instagram messages come here
+app.get('/', (req, res) => {
+  res.send('Hannah is running - PAGE_TOKEN set: ' + !!PAGE_ACCESS_TOKEN);
+});
+
+async function sendReply(recipientId, text, igUserId) {
+  if (!PAGE_ACCESS_TOKEN || !recipientId) return;
+  // For Instagram Business Login, send via IG user ID endpoint
+  const endpoints = [
+    `https://graph.facebook.com/v19.0/${igUserId || IG_USER_ID || 'me'}/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+    `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`
+  ];
+  for (const url of endpoints) {
+    try {
+      const payload = {
+        recipient: { id: recipientId },
+        message: { text: text }
+      };
+      console.log(`Sending reply via ${url} to ${recipientId}: ${text}`);
+      const resp = await axios.post(url, payload);
+      console.log('Reply SUCCESS:', resp.data);
+      return true;
+    } catch (e) {
+      console.error('Send failed via', url, ':', JSON.stringify(e.response?.data || e.message).substring(0,1500));
+    }
+  }
+  return false;
+}
+
+function getReply(text) {
+  const lower = (text || '').toLowerCase();
+  if (!lower) return null;
+  if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) return "Heyy! It's Hannah 💫 — RevlAsH's assistant! How can I help today?";
+  if (lower.includes('price')) return "For pricing, tell me what you need and I'll have RevlAsH get back to you! 🔥";
+  if (lower.includes('commission')) return "Got it! Share details + budget — RevlAsH will reply soon!";
+  return "Heyy! It's Hannah 💫 Thanks for DMing @ashgod_og! What did you need?";
+}
+
 app.post('/webhook', async (req, res) => {
   const body = req.body;
-  if (body.object === 'instagram' || body.object === 'page') {
-    for (const entry of body.entry) {
-      for (const messaging of entry.messaging || []) {
-        const senderId = messaging.sender?.id;
-        const messageText = messaging.message?.text?.toLowerCase() || '';
-        if (!senderId || !messageText) continue;
-        
-        // Find matching automation
-        let reply = null;
-        for (const auto of automations) {
-          if (messageText.includes(auto.trigger)) { reply = auto.response; break; }
+  console.log('=== POST /webhook FULL BODY START ===');
+  console.log(JSON.stringify(body, null, 2).substring(0, 10000));
+  console.log('=== POST /webhook FULL BODY END ===');
+  
+  try {
+    for (const entry of body.entry || []) {
+      console.log('Entry keys:', Object.keys(entry));
+      console.log('Entry id:', entry.id, 'uid:', entry.uid, 'time:', entry.time);
+      console.log('Entry full:', JSON.stringify(entry).substring(0, 5000));
+      
+      // Try all possible message locations
+      let messagesToProcess = [];
+      
+      // Format 1: entry.messaging (old Messenger)
+      if (entry.messaging) {
+        console.log('Found entry.messaging with', entry.messaging.length, 'items');
+        for (const m of entry.messaging) {
+          messagesToProcess.push({
+            senderId: m.sender?.id,
+            text: m.message?.text,
+            raw: m
+          });
         }
-        if (!reply) reply = "Heyy! It's Hannah 💫 Thanks for DMing! RevlAsH is away but I'll make sure he sees this. What did you need?";
-
-        // Send reply back to Instagram
-        if (PAGE_ACCESS_TOKEN) {
-          try {
-            await axios.post(`https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`, {
-              recipient: { id: senderId },
-              message: { text: reply }
+      }
+      
+      // Format 2: entry.changes (new Instagram Graph API)
+      if (entry.changes) {
+        console.log('Found entry.changes with', entry.changes.length, 'items');
+        for (const change of entry.changes) {
+          console.log('Change field:', change.field);
+          console.log('Change value keys:', Object.keys(change.value || {}));
+          console.log('Change value full:', JSON.stringify(change.value).substring(0,3000));
+          if (change.field === 'messages') {
+            const v = change.value || {};
+            messagesToProcess.push({
+              senderId: v.sender?.id || v.from?.id,
+              text: v.message?.text || v.text || (typeof v.message === 'string' ? v.message : null),
+              raw: v
             });
-            console.log(`Replied to ${senderId}: ${reply}`);
-          } catch (e) {
-            console.error('Send error:', e.response?.data || e.message);
           }
         }
       }
+      
+      // Format 3: Direct entry with messaging inside? (some Instagram business login payloads)
+      // Some payloads have entry.id as IG user, and messaging inside entry
+      // Already covered, but also check if entry itself is a message
+      if (entry.message || entry.messages) {
+        console.log('Found direct entry.message');
+      }
+      
+      console.log('Total messages to process:', messagesToProcess.length);
+      
+      for (const msg of messagesToProcess) {
+        console.log('Processing message:', JSON.stringify(msg).substring(0,1000));
+        if (!msg.senderId || !msg.text) {
+          console.log('Skipping - no sender or text');
+          continue;
+        }
+        // Don't reply to self
+        if (msg.senderId == entry.id || msg.senderId == entry.uid) {
+          console.log('Skipping self-message');
+          continue;
+        }
+        const reply = getReply(msg.text);
+        if (reply) {
+          console.log(`Replying to ${msg.senderId}: ${reply}`);
+          await sendReply(msg.senderId, reply, entry.id);
+        }
+      }
     }
-    res.status(200).send('EVENT_RECEIVED');
-  } else {
-    res.sendStatus(404);
+  } catch (err) {
+    console.error('Handler error:', err, err.stack);
   }
+  
+  res.status(200).send('EVENT_RECEIVED');
 });
 
-app.get('/', (req, res) => res.send('Hannah is running 💫 - /webhook is ready'));
-
 app.listen(PORT, () => console.log(`Hannah running on port ${PORT}`));
+module.exports = app;
